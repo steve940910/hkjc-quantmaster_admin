@@ -302,11 +302,272 @@
 
 </div>
 
+<!-- HKJC 確定性計分引擎 (v4.0, 由 hkjc_engine.js 移植) -->
+<script>
+/* ============================================================================
+ * HKJC Quant Master — 確定性計算引擎 (JS 版, v4.0)
+ * 與 hkjc_engine.py 邏輯一致。供 dashboard 內嵌使用。
+ * 用法: const scored = HKJC_ENGINE.run(featureJson);  // 回傳 dashboard 舊格式
+ * ==========================================================================*/
+const HKJC_ENGINE = (function () {
+  const P = {
+    turf_1_4: { baseline: 0.40, form: 0.60, health_mult: 1.0 },
+    class5:   { baseline: 0.70, form: 0.30, health_mult: 2.0 },
+    dirt:     { baseline: 0.40, form: 0.60, health_mult: 1.0 },
+    weight_delta_lbs: 10, weight_penalty: -2.0,
+    long_layoff_days: 30, layoff_penalty: -2.0,
+    dirt_frontrunner_bonus: 3.0, dirt_kickback_penalty: -2.0, dirt_inner_draw_max: 5,
+    class_drop_mult: 1.15, perfect_trip_penalty: -1.5,
+    shadow_uncertainty_discount: 0.95,
+    ppi_fast: 6.0, ppi_slow: 3.0,
+    small_field_threshold: 7, small_field_back_penalty: -1.5, small_field_lead_bonus: 1.0,
+    core_top_n: 3, value_tir_trigger: 2.5,
+    chronic_block_count: 2,
+  };
+
+  const POS_NOTATION = /[\(（][0-9０-９WwＷ\s]+[\)）]/g;
+  // [score, regex, label] 由嚴重到輕
+  const TIR_PATTERNS = [
+    [3.0, /受阻|阻礙|被迫收慢|blocked|checked|held up/, "受阻"],
+    [2.5, /未能望空|難以望空|no clear run/, "未能望空"],
+    [2.0, /走大外疊|走最外疊|走外疊|走第四疊|走第三疊|wide/, "走外疊"],
+    [1.5, /失蹄|起步.{0,4}慢|出閘.{0,4}慢|躍出.{0,4}慢|稍慢|slow (to begin|away)/, "起步緩慢"],
+    [1.0, /擠迫|碰撞|觸碰|crowded|hamper/, "受擠迫"],
+  ];
+  const TIR_BLOCK_KW = /受阻|阻礙|被迫收慢|未能望空|難以望空/;
+  const TIR_DIRECTIONAL = /直路.{0,12}(受阻|阻礙|未能望空|難以望空)/;
+  const TIR_DIRT_WIDE = 0.5;
+
+  const round1 = (x) => Math.round(x * 10) / 10;
+  const num = (v) => (typeof v === "number" && !isNaN(v) ? v : null);
+
+  function surfaceKey(surface, raceClass) {
+    const s = (surface || "").toLowerCase();
+    if (s.includes("dirt") || s.includes("all weather") || s.includes("awt") || s.includes("泥")) return "dirt";
+    if (String(raceClass).includes("5")) return "class5";
+    return "turf_1_4";
+  }
+  function baselineOf(arr) {
+    const vals = (arr || []).filter((e) => e && e > 0).sort((a, b) => b - a);
+    if (!vals.length) return null;
+    const top = vals.slice(0, 3);
+    return top.reduce((a, b) => a + b, 0) / top.length;
+  }
+  function formOf(arr) {
+    const vals = (arr || []).filter((e) => e && e > 0);
+    if (!vals.length) return null;
+    if (vals.length === 1) return vals[0];
+    return vals[0] * 0.6 + vals[1] * 0.4;
+  }
+  function healthAdj(h) {
+    let adj = 0;
+    if (num(h.body_weight) && num(h.last_win_weight) &&
+        Math.abs(h.body_weight - h.last_win_weight) >= P.weight_delta_lbs) adj += P.weight_penalty;
+    if (num(h.days_since_run) && h.days_since_run > P.long_layoff_days && !h.had_recent_trial) adj += P.layoff_penalty;
+    return adj;
+  }
+
+  function computeTir(comments, isDirt) {
+    if (!comments || !comments.length) return [0, ""];
+    const cleaned = comments.map((c) => String(c).replace(POS_NOTATION, " "));
+    const blockHits = cleaned.filter((c) => TIR_BLOCK_KW.test(c)).length;
+    if (blockHits >= P.chronic_block_count) return [0, `習慣性受阻x${blockHits}(TIR收回)`];
+    for (const c of cleaned) if (TIR_DIRECTIONAL.test(c)) return [4.0, "直路受阻"];
+    for (const [score, pat, label] of TIR_PATTERNS) {
+      if (cleaned.some((c) => pat.test(c))) {
+        const s = (isDirt && label === "走外疊") ? TIR_DIRT_WIDE : score;
+        return [s, label];
+      }
+    }
+    return [0, ""];
+  }
+
+  function computePpi(styles, fieldSize) {
+    const up = styles.map((s) => String(s).toUpperCase().trim());
+    const nLead = up.filter((s) => s === "LEADER").length;
+    const nPace = up.filter((s) => s === "ON-PACE" || s === "ON PACE" || s === "ONPACE").length;
+    const raw = 1.5 * nLead + 1.0 * nPace;
+    const fs = fieldSize || up.filter((s) => s).length || 1;
+    const ppi = round1((10.0 * raw) / fs);   // 場次規模正規化 (典型約 3-5)
+    let label = "Medium";
+    if (ppi >= P.ppi_fast) label = "High";
+    else if (ppi <= P.ppi_slow) label = "Slow";
+    return [ppi, label];
+  }
+
+  function paceFit(style, ppi, fieldSize) {
+    style = String(style).toUpperCase().trim();
+    let fit = 0;
+    if (ppi >= P.ppi_fast) fit = { BACK: 1.5, MIDFIELD: 0.5, "ON-PACE": -0.5, LEADER: -1.5 }[style] || 0;
+    else if (ppi <= P.ppi_slow) fit = { LEADER: 1.5, "ON-PACE": 1.0, MIDFIELD: -0.5, BACK: -1.5 }[style] || 0;
+    if (fieldSize && fieldSize <= P.small_field_threshold) {
+      if (style === "BACK") fit += P.small_field_back_penalty;
+      else if (style === "LEADER" || style === "ON-PACE") fit += P.small_field_lead_bonus;
+    }
+    return round1(fit);
+  }
+
+  function computeDmr(h, sKey, classAvg) {
+    let baseline = baselineOf(h.energy_same_cond);
+    let form = formOf(h.energy_recent);
+    const notes = [];
+
+    // 影子建模 (新馬)
+    if (h.is_debutant || (baseline === null && form === null)) {
+      if (classAvg === null) return [0, "Shadow", "無班次基準,無法影子建模"];
+      let v = classAvg;
+      if (num(h.sire_surface_roi) !== null) {
+        v += Math.min(Math.max(h.sire_surface_roi * 5.0, -3), 5);
+        notes.push(`PSS(${h.sire_surface_roi})`);
+      }
+      const t = (h.trial_text || "").toLowerCase();
+      if (/輕鬆|未受催策|easy|comfortabl|unridden|held/.test(t)) { v += 3.0; notes.push("試閘輕鬆+3"); }
+      else if (/受催策|hard ridden|pushed/.test(t)) { v -= 1.0; notes.push("試閘受催-1"); }
+      v *= P.shadow_uncertainty_discount;
+      return [round1(v), "Shadow", "影子建模 " + notes.join(" ")];
+    }
+
+    const p = P[sKey];
+    if (baseline === null) {
+      const pool = [...(h.energy_recent || []), ...(h.energy_same_cond || [])].filter((e) => e && e > 0);
+      baseline = pool.length ? Math.max(...pool) : (form || 0);
+    }
+    if (form === null) form = baseline || 0;
+    const health = healthAdj(h) * p.health_mult;
+    let dmr = baseline * p.baseline + form * p.form + health;
+    notes.push(`B(${Math.round(baseline)})*${p.baseline}+F(${Math.round(form)})*${p.form}`);
+    if (health) notes.push(`H${health > 0 ? "+" : ""}${round1(health)}`);
+
+    if (sKey === "dirt") {
+      const style = String(h.running_style).toUpperCase().trim();
+      if ((style === "LEADER" || style === "ON-PACE") && h.draw && h.draw <= P.dirt_inner_draw_max) {
+        dmr += P.dirt_frontrunner_bonus; notes.push(`泥地前領+${P.dirt_frontrunner_bonus}`);
+      } else if (style === "BACK" || style === "MIDFIELD") {
+        if (!((h.sire_surface_roi || 0) > 0.1)) { dmr += P.dirt_kickback_penalty; notes.push(`踢土${P.dirt_kickback_penalty}`); }
+      }
+    }
+    if (h.class_dropped) { dmr *= P.class_drop_mult; notes.push(`降班x${P.class_drop_mult}`); }
+    if (h.last_race_easy_slow_lead) { dmr += P.perfect_trip_penalty; notes.push(`好位罰${P.perfect_trip_penalty}`); }
+    return [round1(dmr), "Actual", notes.join(" ")];
+  }
+
+  function classifyDualTrack(rs) {
+    const actual = rs.filter((r) => r.dmr_type === "Actual" && r.dmr > 0).sort((a, b) => b.dmr - a.dmr);
+    const coreNums = new Set(actual.slice(0, P.core_top_n).map((r) => r.number));
+    for (const r of rs) {
+      if (r.dmr_type === "Shadow") { r.track = "VALUE"; r.note = ("[覆蓋·高方差] " + r.note).trim(); continue; }
+      if (r.dmr <= 0) { r.track = "LOW"; continue; }
+      const isCore = coreNums.has(r.number);
+      const tirLifted = r.tir_bonus >= P.value_tir_trigger;
+      if (isCore && r.tir_bonus >= 0) r.track = "CORE";
+      else if (tirLifted || r.class_dropped) r.track = "VALUE";
+      else r.track = "AVERAGE";
+    }
+    const nonshadow = rs.filter((r) => r.dmr_type === "Actual" && r.dmr > 0);
+    if (nonshadow.length) {
+      const sorted = nonshadow.map((r) => r.dmr).sort((a, b) => a - b);
+      const lowCut = sorted[Math.max(0, Math.ceil(nonshadow.length / 4) - 1)];
+      for (const r of nonshadow) if (r.track === "AVERAGE" && r.dmr <= lowCut) r.track = "LOW";
+    }
+    return rs;
+  }
+
+  const TRACK_TO_RANK = { CORE: "Core", VALUE: "Value", AVERAGE: "Average", RISK: "Risk", LOW: "Low" };
+
+  function bettingShape(rs, gap, hasSingleBanker) {
+    const core = rs.filter((r) => r.track === "CORE").sort((a, b) => b.dmr - a.dmr);
+    const value = rs.filter((r) => r.track === "VALUE");
+    if (!core.length) return "混戰: 無穩定核心,只宜小注覆蓋 VALUE 軌或放棄。";
+    const msg = [];
+    if (hasSingleBanker) msg.push(`單膽格局: #${core[0].number} 拋離,作膽拖 2-4 名。`);
+    else if (core.length >= 2 && gap < 2) msg.push(`雙龍出海: #${core[0].number} / #${core[1].number} 接近,Q/QP 互串。`);
+    else msg.push("標準核心: 以 CORE 軌組位置Q。");
+    if (value.length) msg.push(`長尾覆蓋: ${value.slice(0, 3).map((r) => "#" + r.number).join("/")} 作配腳拖入單T/四連環 (重 ROI,小注)。`);
+    return msg.join(" ");
+  }
+
+  function run(race) {
+    const info = race.race_info || race.race || {};
+    const raceClass = info.class || "";
+    const horses = race.horses || [];
+    const fieldSize = info.field_size || horses.length;
+    const sKey = surfaceKey(info.surface || info.course || "", raceClass);
+    const isDirt = sKey === "dirt";
+
+    const todayClsMatch = String(raceClass).match(/\d+/);
+    const todayCls = todayClsMatch ? parseInt(todayClsMatch[0], 10) : null;
+    for (const h of horses) {
+      if (h.last_race_class != null && todayCls != null) h.class_dropped = todayCls > h.last_race_class;
+    }
+
+    const bases = horses.map((h) => baselineOf(h.energy_same_cond)).filter((b) => b);
+    const classAvg = bases.length ? bases.sort((a, b) => a - b)[Math.floor(bases.length / 2)] : null;
+
+    const [ppi, ppiLabel] = computePpi(horses.map((h) => h.running_style), fieldSize);
+
+    const results = horses.map((h) => {
+      const [dmr, dtype, note] = computeDmr(h, sKey, classAvg);
+      const [tir, treason] = computeTir(h.comments_recent, isDirt);
+      const final = dtype === "Actual" ? round1(dmr + tir) : dmr;
+      return {
+        number: h.number, name_ch: h.name_ch || "", name_en: h.name_en || "",
+        dmr: final, dmr_type: dtype, tir_bonus: tir, tir_reason: treason,
+        track: "", note, running_style: h.running_style || "MIDFIELD",
+        draw: h.draw, class_dropped: !!h.class_dropped,
+      };
+    });
+
+    classifyDualTrack(results);
+
+    // 單膽偵測 + Banker 標記
+    const core = results.filter((r) => r.track === "CORE").sort((a, b) => b.dmr - a.dmr);
+    const gap = core.length > 1 ? core[0].dmr - core[1].dmr : 99;
+    const hasSingleBanker = core.length > 0 && gap >= 4;
+    const bankerNum = hasSingleBanker ? core[0].number : null;
+
+    const shape = bettingShape(results, gap, hasSingleBanker);
+
+    // 轉成 dashboard 舊格式
+    const outHorses = results.sort((a, b) => a.number - b.number).map((r) => {
+      const tirStr = "+" + r.tir_bonus.toFixed(1) + (r.tir_reason ? ` (${r.tir_reason})` : "");
+      let rank = TRACK_TO_RANK[r.track] || "Average";
+      if (r.number === bankerNum) rank = "Banker";
+      return {
+        number: r.number, name: r.name_en || r.name_ch, name_ch: r.name_ch,
+        dmr_score: r.dmr, tir_bonus: tirStr, rank_prediction: rank,
+        running_style: r.running_style, barrier_draw: r.draw == null ? "" : r.draw,
+        dmr_type: r.dmr_type,
+      };
+    });
+
+    return {
+      race_info: {
+        date: info.date || "", venue: info.venue || "", race_no: info.race_no || "",
+        class: info.class || "-", course: info.course || "-", distance: info.distance || "",
+        ppi_score: `${ppi} (${ppiLabel})`,
+      },
+      horses: outHorses,
+      _betting_shape: shape,
+    };
+  }
+
+  // 偵測是否為「特徵格式」(需計分) — 馬匹缺 dmr_score 即係特徵格式
+  function isFeatureFormat(data) {
+    return data && Array.isArray(data.horses) && data.horses.length > 0 &&
+      (data.horses[0].dmr_score === undefined || data.horses[0].dmr_score === null);
+  }
+
+  return { run, isFeatureFormat };
+})();
+
+if (typeof module !== "undefined" && module.exports) module.exports = HKJC_ENGINE;
+
+</script>
 <script>
     // ==========================================
     // 🔑 請將此處替換為你的 Apps Script 網址
     // ==========================================
-    const GAS_URL = "https://script.google.com/macros/s/AKfycbwmLL4nDIwmReQ_WGjeekHKlZDBFxTRMfudynfZgukXJzwh50xiqbUHZxzwE5nHAFG2ng/exec"; 
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbxVMH5R3yktOXgH4tzJvHjLvep66MgNMs4KLFJhLgxLAA1OyS3RWKywDDZ6HlVc7_Io/exec"; 
     // ==========================================
 
     // 歷史班次勝率與上名率統計 (從你的 CSV 數據庫提取)
@@ -339,14 +600,18 @@
     function parseData() {
         const input = document.getElementById('json-input').value;
         try {
-            const data = JSON.parse(input);
+            let data = JSON.parse(input);
+            if (typeof HKJC_ENGINE !== "undefined" && HKJC_ENGINE.isFeatureFormat(data)) {
+                data = HKJC_ENGINE.run(data);
+                console.log("[v4.0] 偵測到特徵格式,已用內建引擎計分。格局:", data._betting_shape);
+            }
             currentData = data;
             document.getElementById('result-entry-section').classList.add('hidden');
             document.getElementById('result-display-card').classList.add('hidden');
             document.getElementById('btn-save').style.display = 'flex';
             document.getElementById('btn-publish').style.display = 'flex';
             renderDashboard(data);
-        } catch (e) { alert("JSON 格式錯誤"); }
+        } catch (e) { console.error(e); alert("JSON 格式錯誤: " + e.message); }
     }
 
     function renderDashboard(data) {
@@ -926,7 +1191,7 @@ const raceClass = data.race_info.class; // 取得當前場次的班次
 
             const results = await Promise.all(promises);
 
-            // 執行嚴格的過關篩選邏輯 (Parlay Filter)
+	// 執行嚴格的過關篩選邏輯 (Parlay Filter)
             results.forEach(resp => {
                 if (!resp || resp.result !== 'success' || !resp.data || !resp.data.race_info || !resp.data.horses) return;
 
@@ -935,23 +1200,26 @@ const raceClass = data.race_info.class; // 取得當前場次的班次
                 const venue = ri.venue || "";
                 const course = ri.course || "";
                 const dist = parseInt(ri.distance) || 0;
-                const ppi = (ri.ppi_score || "").toLowerCase();
                 const cls = ri.class || "";
+                const ppi = (ri.ppi_score || "").toLowerCase(); // 🐎 將 ppi_score 轉成小寫方便比對
 
-                // ❌ 排除地雷 1: 泥地 (Dirt / All Weather)
+                // ❌ 條件 1: 排除泥地 (Dirt / All Weather)
                 if (course.includes('All Weather') || course.includes('Dirt') || venue.includes('All Weather')) return;
                 
-                // ❌ 排除地雷 2: 慢步速 (Slow Pace)
-                if (ppi.includes('slow')) return;
-                
-                // ❌ 排除地雷 3: 第五班 (Class 5) 賽事
+                // ❌ 條件 2: 排除第五班 (Class 5) 賽事
                 if (cls.includes('Class 5') || cls.includes('5班')) return;
                 
-                // ❌ 排除地雷 4: 特定毒藥路程 (田草1000/1200/2000, 谷草1650)
-                if (venue.includes('Sha Tin') && (dist === 1000 || dist === 1200 || dist === 2000)) return;
-                if (venue.includes('Happy Valley') && dist === 1650) return;
+                // ❌ 條件 3: 排除新馬賽 (Griffin / 新馬)
+                if (cls.includes('Griffin') || cls.includes('新馬')) return;
 
-                // 👥 條件 5: 找出 Core 和 Value 馬，且數量必須剛好在 4 ~ 5 匹之間
+                // ❌ 條件 4: 排除含有「初出馬」的賽事 (dmr_type 為 "Shadow")
+                const hasDebutHorse = data.horses.some(h => h.dmr_type && h.dmr_type.toLowerCase() === 'shadow');
+                if (hasDebutHorse) return;
+
+                // ❌ 條件 5: 排除慢步速賽事 (包含 slow 或 慢)
+                if (ppi.includes('slow') || ppi.includes('慢')) return;
+
+                // 👥 條件 6: 找出 Core 和 Value 馬，且數量必須剛好在 4 ~ 5 匹之間
                 const cvHorses = data.horses.filter(h => h.rank_prediction && (h.rank_prediction.includes('Core') || h.rank_prediction.includes('Value')));
                 if (cvHorses.length < 4 || cvHorses.length > 5) return;
 
@@ -970,7 +1238,7 @@ const raceClass = data.race_info.class; // 取得當前場次的班次
             if (validRaces.length === 0) {
                 container.innerHTML = '<div class="text-sm text-slate-400 italic py-2 flex items-center gap-2">🛡️ <span class="text-yellow-500 font-bold">系統判定：</span> 今日無符合「嚴格過關條件」的賽事，建議忍手或改為單場小注。</div>';
             } else {
-                let html = '<div class="flex items-end justify-between mb-3"><h3 class="text-emerald-400 font-bold text-lg flex items-center gap-2">🎯 賽日精選</h3><span class="text-xs text-slate-500">已排除慢步速、泥地及低勝率路程</span></div>';
+                let html = '<div class="flex items-end justify-between mb-3"><h3 class="text-emerald-400 font-bold text-lg flex items-center gap-2">🎯 賽日精選</h3><span class="text-xs text-slate-500">已排除泥地、五班、新馬、初出馬及慢步速賽事</span></div>';
                 html += '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">';
                 
                 validRaces.forEach(r => {
